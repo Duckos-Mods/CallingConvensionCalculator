@@ -5,9 +5,9 @@
 #include <cstdint>
 #include <stdexcept>
 
-// Check if is x86_64 if not throw error at compile time 
 #if !defined(__x86_64__) && !defined(_M_X64)
 	#error "This library only supports x86_64"
+    #error "This is due to the fact that I only need to support x86_64 MSVC"
 #endif
 #ifndef TO_UNDERLYING
 #define TO_UNDERLYING(x) static_cast<std::underlying_type_t<decltype(x)>>(x)
@@ -16,7 +16,9 @@
 #define TO_ENUM(enumType, val) static_cast<enumType>(val)
 #endif
 
-
+// Remove dumb warnings i legit can not fix like padding warnings
+#pragma warning(disable: 4820)
+#pragma warning(disable: 5045)
 namespace CCC 
 {
 
@@ -58,26 +60,30 @@ namespace CCC
     
     struct ArgumentInformation
     {
+        size_t size;
         ArgumentType type;
-		size_t size;
     };
     struct VariableData
     {
         VariableLocation location   = VariableLocation::NONE;
         CopyType copyType           = CopyType::NONE;
-        uint32_t size               = -1;
-        uint32_t index              = -1;
-
+        uint32_t size               = (uint32_t)-1;
+        uint32_t index              = (uint32_t)-1;
+    };
+    struct VariableProcessingData
+    {
+        uint32_t size   = (uint32_t)-1; // Just loops to the max
+        bool isFloat    = false; 
     };
 
     namespace Internal
     {
-        inline VariableLocation IndexToRegister(bool isFloat, int index)
+        inline VariableLocation IndexToRegister(bool isFloat, uint32_t index)
         {
             return TO_ENUM(VariableLocation, isFloat ? TO_UNDERLYING(VariableLocation::XMM0) + index : TO_UNDERLYING(VariableLocation::RCX) + index);
         };
 
-        inline int RemapIndex(int Index, int Max, int Min = 3)
+        inline uint32_t RemapIndex(uint32_t Index, uint32_t Max, uint32_t Min = 3)
         {
             return Max - Index + Min;
         }
@@ -89,11 +95,40 @@ namespace CCC
     template<size_t argCount, typename... Args>
     constexpr std::array<size_t, argCount> GetVariableSizesAsArray() noexcept{return {sizeof(Args)...};}
 
+    inline std::vector<ArgumentInformation> GetArgumentInformationForTypes(
+            std::span<VariableProcessingData> variableProcessingData
+        )
+    {
+        std::vector<ArgumentInformation> VariableInformation;
+        VariableInformation.reserve(variableProcessingData.size());
+        for (auto& VA : variableProcessingData)
+        {
+            ArgumentInformation AI{};
+            AI.size = VA.size;
+            if (VA.isFloat)
+                AI.type = ArgumentType::FLOAT_OR_DOUBLE;
+            else if (VA.size <= 8)
+                AI.type = ArgumentType::INTEGER_OR_AGREGATE;
+            else
+                AI.type = ArgumentType::OTHER;
+            VariableInformation.emplace_back(AI);
+        }
+        return VariableInformation;
+    }
+
+    inline bool GetBumpRequirementsForType(VariableProcessingData VI)
+    {
+        if (VI.size > 8)
+            return true;
+        else
+            return false;
+    }
 
     inline std::vector<VariableData> GetVariableDataForVariableSizes(
         std::span<ArgumentInformation> variableSizes,
+        bool bumpRegisters = false,
         CallingConvention callingConvention = CallingConvention::FASTCALL) 
-        throw (std::invalid_argument)
+        noexcept(false)
     {
         switch (callingConvention)
         {
@@ -108,29 +143,35 @@ namespace CCC
         }
         std::vector<VariableData> variableData(variableSizes.size()); // Pre allocate :3
         std::array<VariableLocation, 4> usedRegisters{VariableLocation::NONE, VariableLocation::NONE, VariableLocation::NONE, VariableLocation::NONE};
-        auto IndexToRegister = [](bool isFloat, int index) -> VariableLocation {
-            return TO_ENUM(VariableLocation,isFloat ? TO_UNDERLYING(VariableLocation::XMM0) + index : TO_UNDERLYING(VariableLocation::RCX) + index);
-            };
-        int globalIndex = 0;
-        size_t loopCount = (variableSizes.size() > 4) ? 4 : variableSizes.size();
-        for (int i = 0; i < loopCount; i++)
+        uint32_t globalIndex = 0;
+        uint32_t loopCount = 0;
+        uint32_t bumpCount = 0;
+        if (!bumpRegisters)
+            loopCount = uint32_t((variableSizes.size() > 4) ? 4 : variableSizes.size());
+        else
+        {
+            loopCount = uint32_t((variableSizes.size() > 3) ? 3 : variableSizes.size());
+            bumpCount = 1;
+        }
+
+        for (uint32_t i = 0; i < loopCount; i++)
         {
             globalIndex = i;
             ArgumentInformation& ai = variableSizes[i];
             VariableData vd{};
-            vd.size = ai.size;
+            vd.size = (uint32_t)ai.size;
             switch (ai.type)
             {
             case ArgumentType::OTHER:
-                vd.location = Internal::IndexToRegister(false, i);
+                vd.location = Internal::IndexToRegister(false, i + bumpCount);
                 vd.copyType = CopyType::ADDRESS_OF_VARIABLE;
                 break;
             case ArgumentType::INTEGER_OR_AGREGATE:
-                vd.location = Internal::IndexToRegister(false, i);
+                vd.location = Internal::IndexToRegister(false, i + bumpCount);
                 vd.copyType = CopyType::VALUE_OF_VARIABLE;
                 break;
             case ArgumentType::FLOAT_OR_DOUBLE:
-                vd.location = Internal::IndexToRegister(true, i);
+                vd.location = Internal::IndexToRegister(true, i + bumpCount);
                 vd.copyType = CopyType::VALUE_OF_VARIABLE;
                 break;
             default:
@@ -143,28 +184,27 @@ namespace CCC
         if (variableSizes.size() <= 4)
             return variableData;
 
-        loopCount = variableSizes.size() - 4;
-        size_t startIndex = loopCount + 3;
-        constexpr size_t lastIndex = 3;
+        loopCount = uint32_t(variableSizes.size()) - 4;
+        uint32_t startIndex = loopCount + 3;
+        constexpr uint32_t lastIndex = 3;
 
-        for (size_t i = startIndex; i > lastIndex; i--)
+        for (uint32_t i = startIndex; i > lastIndex; i--)
 		{
-            size_t idx = Internal::RemapIndex(i, variableSizes.size() - 1, lastIndex+1);
+            size_t idx = Internal::RemapIndex(i, uint32_t(variableSizes.size() - 1), lastIndex+1);
 			ArgumentInformation& ai = variableSizes[i];
 			VariableData vd{};
-            vd.size = ai.size;
+            vd.size = (uint32_t)ai.size;
             vd.location = VariableLocation::STACK;
-            vd.index = i;
+            vd.index = (uint32_t)i;
             if (ai.type == ArgumentType::OTHER)
-                vd.copyType = CopyType::ADDRESS_OF_VARIABLE;
+                vd.copyType = CopyType::ADDRESS_OF_VARIABLE; // This handles all types larger than 8 bytes
             else
                 vd.copyType = CopyType::VALUE_OF_VARIABLE;
             variableData[idx] = vd;
 		}
-
-
-
-
         return variableData;
     }
 }
+
+#pragma warning(default: 4820)
+#pragma warning(default: 5045)
