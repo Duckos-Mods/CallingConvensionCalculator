@@ -1,6 +1,8 @@
 #include "CCC.hpp"
 #include <iostream>
 
+#ifdef Testing
+
 int main()
 {
     std::vector<CCC::ArgumentInformation> argInfo(7);
@@ -23,3 +25,4 @@ int main()
     auto FuncInfo = CCC::GetFunctionDataForFunc(retInfo, argInfo);
     return 0;
 }
+#endif
